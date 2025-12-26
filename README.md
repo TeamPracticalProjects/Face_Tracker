@@ -1,4 +1,5 @@
-* Face Tracker
+# Face Tracker.
+
   This project controls a servo based pan/tilt mechanism to trace a face in view of a camera.  The project uses Python and OpenCV to acquire
   a face and track its position in realtime.  The Python code places a bounding rectangle on the detected face and sends the x,y
   image coordinates of the center of this bounding rectangle out over Serial I/O in the form of x,y where positive x is right, negative
