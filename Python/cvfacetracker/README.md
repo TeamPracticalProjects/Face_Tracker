@@ -41,11 +41,12 @@ This will:
 - Detect and track faces in real-time
 - Display bounding boxes around detected faces
 - Show FPS and face count
+- Output to the serial port the center coordinates of a box bounding the largest face detected
 - Press 'q' or ESC to quit
 
 To use a different camera (if you have multiple cameras):
 ```bash
-python face_tracker.py 1  # Use camera index 1
+python face_tracker.py 1  # Use camera index 1 serial-port
 ```
 
 ## Project Structure
