@@ -1,5 +1,5 @@
 /************************************************************************************
-  servomove.ino:  Arduino software to move pan/tilt servo system based upon serial
+  servomove.ino: Arduino software to move pan/tilt servo system based upon serial
     input in the form of x,y, where x and y are signed integers.
 
     The values of x and y are pixel values in image space, relative to the center
@@ -103,8 +103,8 @@ void movePanTilt(int newX, int newY){
   #endif
 
   // the new servo positions
-  newPanServo = round(newXServo);
-  newTiltServo = round(newYServo);
+  newPanServo = newXServo;
+  newTiltServo = newYServo;
 
   // constrain the servo values to be withon 0 - 180 degrees
   newPanServo = constrain(newPanServo, PAN_SERVO_MINIMUM, PAN_SERVO_MAXIMUM);

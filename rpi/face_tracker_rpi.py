@@ -5,12 +5,38 @@ Captures video from the laptop camera and tracks faces in real-time.
 
 2026 01 16 removed listing of available cameras to reduce console clutter
            added print of actual camera resolution after initialization
+2026 01 18 modified to work with Raspberry Pi and GPIOZero servos
+
 """
 
 import cv2
 import sys
 import serial
 import time
+from gpiozero import AngularServo, Device
+from gpiozero.pins.pigpio import PiGPIOFactory
+
+# Use RPi.GPIO for PWM
+Device.pin_factory = PiGPIOFactory()
+
+SERVO_PAN_PIN = 12  # Hardware PWM capable
+SERVO_TILT_PIN = 13  # Hardware PWM capable
+
+# set these values to correspond to the field of view of your camera 
+# and the mechanism limits. Full range is -1.0 to +1.0
+# For a camera with 70 degrees x and y, use about +/-0.14 (70/180 = 0.38)
+SERVO_PAN_MIN = -0.38
+SERVO_PAN_MAX = 0.38
+SERVO_TILT_MIN = -0.38
+SERVO_TILT_MAX = 0.38
+INVERT_Y_SERVO = True  # Set to True if up is negative for your servo setup
+
+HORIZONTAL_FOV_SERVO = 70.0 / 180 
+VERTICAL_FOV_SERVO = 70.0 / 180
+
+# servo setup
+servoPan = AngularServo(SERVO_PAN_PIN, min_pulse_width=0.0006, max_pulse_width=0.0024)
+servoTilt = AngularServo(SERVO_TILT_PIN, min_pulse_width=0.0006, max_pulse_width=0.0024)
 
 
 class FaceTracker:
@@ -36,6 +62,10 @@ class FaceTracker:
         self.frame_width = 0
         self.frame_height = 0
         
+        # current servo positions, servos should be positioned at center (0.0) at start
+        self.servoPanPos = 0.0
+        self.servoTiltPos = 0.0
+
     def initialize(self):
         """Initialize camera and face detection classifier."""
         print("Initializing face tracker...")
@@ -204,7 +234,12 @@ class FaceTracker:
         Args:
             faces: List of detected faces
         """
-        if self.ser is None or len(faces) == 0:
+        # TESTING
+        servoPan.value = 0.0
+        servoTilt.value = 0.0
+        return
+    
+        if len(faces) == 0:
             return
         
         # Find the largest face by area
@@ -214,20 +249,57 @@ class FaceTracker:
         # Calculate center of face
         center_x = x + w // 2
         center_y = y + h // 2
+        print(f"Largest face center: ({center_x}, {center_y})")
         
         # Transform to center-origin coordinate system
         # (0,0) at center of frame, positive X to left, positive Y up
         transformed_x = (self.frame_width // 2) - center_x  # Inverted X
         transformed_y = (self.frame_height // 2) - center_y  # Inverted Y
+        print(f"Transformed coordinates: ({transformed_x}, {transformed_y})")
         
-        # Send to serial port
+        # Scale transformed_x to servo pan range
+        # Map from [-frame_width/2, frame_width/2] to [SERVO_PAN_MIN, SERVO_PAN_MAX]
+        max_x = self.frame_width // 2
+        if max_x > 0:
+            scaled_x = (transformed_x / max_x) * ((SERVO_PAN_MAX - SERVO_PAN_MIN) / 2)
+            scaled_x = max(SERVO_PAN_MIN, min(SERVO_PAN_MAX, scaled_x))
+        else:
+            scaled_x = 0
+        
+        # Scale transformed_y to servo tilt range
+        max_y = self.frame_height // 2
+        if max_y > 0:
+            scaled_y = (transformed_y / max_y) * ((SERVO_TILT_MAX - SERVO_TILT_MIN) / 2)
+            scaled_y = max(SERVO_TILT_MIN, min(SERVO_TILT_MAX, scaled_y))
+        else:
+            scaled_y = 0
+        print(f"Scaled to servo range: ({scaled_x:.3f}, {scaled_y:.3f})")
+
+        print(f"Current servo positions before update: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
+        # Move the position relative to current position
+        self.servoPanPos += scaled_x
+        if INVERT_Y_SERVO:
+            scaled_y = -scaled_y
+        self.servoTiltPos += scaled_y
+        print(f"Updated servo positions before clamp: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
+
+        # Clamp to servo limits
+        self.servoPanPos = max(-1, min(1, self.servoPanPos))
+        self.servoTiltPos = max(-1, min(1, self.servoTiltPos))   
+        print(f"Clamped servo positions: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
+
+        #TESTING
+        self.servoPanPos = 0.0
+
+
+        print(f"Sent to servos: {self.servoPanPos:.3f}, {self.servoTiltPos:.3f}")
+        # Move Servos
         try:
-            message = f"{transformed_x},{transformed_y}\n"
-            self.ser.write(message.encode())
-            print(f"Sent to serial: {message.strip()}")
+            servoPan.value = self.servoPanPos
+            servoTilt.value = self.servoTiltPos
             time.sleep(0.2) # wait for servo to repond before sending new data
         except Exception as e:
-            print(f"Serial write error: {e}")
+            print(f"servo write error: {e}")
     
     def draw_faces(self, frame, faces):
         """
@@ -239,8 +311,8 @@ class FaceTracker:
         """
         for i, (x, y, w, h, face_type) in enumerate(faces):
             # Print coordinates
-            print(f"Face {i + 1} ({face_type}): x={x}, y={y}, width={w}, height={h}, "
-                  f"top-left=({x},{y}), bottom-right=({x+w},{y+h})")
+            #print(f"Face {i + 1} ({face_type}): x={x}, y={y}, width={w}, height={h}, "
+             #     f"top-left=({x},{y}), bottom-right=({x+w},{y+h})")
             
             # Choose color based on face type
             if face_type == 'frontal':
@@ -327,10 +399,10 @@ class FaceTracker:
                     fps = frame_count / elapsed_time
                 
                 # Add info overlay
-                self.add_info_overlay(frame, faces, fps)
+                #self.add_info_overlay(frame, faces, fps)
                 
                 # Display the frame
-                cv2.imshow('Face Tracker - OpenCV', frame)
+                #cv2.imshow('Face Tracker - OpenCV', frame)
                 
                 # Check for quit key
                 key = cv2.waitKey(1) & 0xFF
@@ -358,7 +430,7 @@ class FaceTracker:
         print("\nFace tracker stopped")
 
 
-def list_available_cameras(max_cameras=5):
+def list_available_cameras(max_cameras=32):
     """
     List all available cameras.
     
@@ -384,9 +456,37 @@ def main():
     print("=" * 60)
     
     # List available cameras
-    # available_cameras = list_available_cameras()
-    # print(f"\nAvailable cameras: {available_cameras}")
-    
+    available_cameras = list_available_cameras()
+    print(f"\nAvailable cameras: {available_cameras}")
+
+    # Test servos
+    testDelaySeconds = 15
+    print("\nTesting servos...")
+    print("Panning servos to FOV left")
+    servoPan.value = SERVO_PAN_MAX
+    servoTilt.value = 0
+    time.sleep(testDelaySeconds)
+    print("Panning servos to FOV right")
+    servoPan.value = SERVO_PAN_MIN
+    time.sleep(testDelaySeconds)    
+    print("Tilting servos to FOV up")
+    servoPan.value = 0
+    if INVERT_Y_SERVO:
+        servoTilt.value = SERVO_TILT_MIN
+    else:
+        servoTilt.value = SERVO_TILT_MAX
+    time.sleep(testDelaySeconds)
+    print("Panning servos to FOV down")
+    servoPan.value = 0
+    if INVERT_Y_SERVO:
+        servoTilt.value = SERVO_TILT_MAX
+    else:       
+        servoTilt.value = SERVO_TILT_MIN
+    time.sleep(testDelaySeconds)
+    servoPan.value = 0
+    servoTilt.value = 0
+    print("Servos test complete.")
+
     # Parse command line arguments
     camera_index = 0
     serial_port = "COM5"  # Use the port that your Arduino is on
