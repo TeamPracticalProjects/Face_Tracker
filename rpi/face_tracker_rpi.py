@@ -35,8 +35,8 @@ SERVO_TILT_MIN = -0.38
 SERVO_TILT_MAX = 0.38
 INVERT_Y_SERVO = True  # Set to True if up is negative for your servo setup
 
-HORIZONTAL_FOV_CAM = 50.0 
-VERTICAL_FOV_CAM = 50.0 
+HORIZONTAL_FOV_CAM = 70.0 
+VERTICAL_FOV_CAM = 22.0 
 
 # servo setup
 servoPan = AngularServo(SERVO_PAN_PIN, min_pulse_width=0.0006, max_pulse_width=0.0024)
@@ -281,13 +281,18 @@ class FaceTracker:
         print(f"Scaled to servo range: ({scaled_x:.3f}, {scaled_y:.3f})")
         """
         # scale center origin to servo movement increments in FOV units
-        scaled_x_servo = (poi_x_cam_center_origin / (self.cam_frame_width / 2)) * (HORIZONTAL_FOV_CAM / self.cam_frame_width)
-        scaled_y_servo = (poi_y_cam_center_origin / (self.cam_frame_height / 2)) * (VERTICAL_FOV_CAM / self.cam_frame_height)
-        print(f"Scaled to servo movement increments: ({scaled_x_servo:.3f}, {scaled_y_servo:.3f})")
+        scaled_x = poi_x_cam_center_origin  * (HORIZONTAL_FOV_CAM / self.cam_frame_width)
+        scaled_y = poi_y_cam_center_origin  * (VERTICAL_FOV_CAM / self.cam_frame_height)
+        print(f"Scaled to FOV increments: ({scaled_x:.3f}, {scaled_y:.3f})")
+
+        # convert increments to servo position changes (-1.0 to +1.0)
+        scaled_x_servo = scaled_x / self.cam_frame_width
+        scaled_y_servo = scaled_y / self.cam_frame_height
+        print(f"Scaled to servo position changes: ({scaled_x_servo:.3f}, {scaled_y_servo:.3f})")
 
         print(f"Current servo positions before update: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
         # Move the position relative to current position
-        self.servoPanPos += scaled_x_servo
+        self.servoPanPos -= scaled_x_servo
         if INVERT_Y_SERVO:
             scaled_y_servo = -scaled_y_servo
         self.servoTiltPos += scaled_y_servo
@@ -298,16 +303,12 @@ class FaceTracker:
         self.servoTiltPos = max(-.8, min(.8, self.servoTiltPos))   
         print(f"Clamped servo positions: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
 
-        #TESTING
-        self.servoTiltPos = 0.0
-
-
         print(f"Sent to servos: {self.servoPanPos:.3f}, {self.servoTiltPos:.3f}")
         # Move Servos
         try:
             servoPan.value = self.servoPanPos
             servoTilt.value = self.servoTiltPos
-            time.sleep(0.4) # wait for servo to repond before sending new data
+            time.sleep(0.2) # wait for servo to repond before sending new data
         except Exception as e:
             print(f"servo write error: {e}")
     
