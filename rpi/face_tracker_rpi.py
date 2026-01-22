@@ -8,6 +8,8 @@ Captures video from the laptop camera and tracks faces in real-time.
 2026 01 18 modified to work with Raspberry Pi and GPIOZero servos
 
 """
+DEBUG = False
+FACE_PROFILE_DETECTION = False  # Set to True to detect profile faces (slower but more comprehensive)
 
 import cv2
 import sys
@@ -15,6 +17,10 @@ import serial
 import time
 from gpiozero import AngularServo, Device
 from gpiozero.pins.pigpio import PiGPIOFactory
+from flask import Flask, render_template, Response
+import threading
+import logging
+import os
 
 # Use RPi.GPIO for PWM
 Device.pin_factory = PiGPIOFactory()
@@ -31,12 +37,19 @@ SERVO_TILT_MIN = -0.38
 SERVO_TILT_MAX = 0.38
 INVERT_Y_SERVO = True  # Set to True if up is negative for your servo setup
 
-HORIZONTAL_FOV_SERVO = 70.0 / 180 
-VERTICAL_FOV_SERVO = 70.0 / 180
+HORIZONTAL_FOV_CAM = 25.0 
+VERTICAL_FOV_CAM = 10.0 
 
 # servo setup
 servoPan = AngularServo(SERVO_PAN_PIN, min_pulse_width=0.0006, max_pulse_width=0.0024)
 servoTilt = AngularServo(SERVO_TILT_PIN, min_pulse_width=0.0006, max_pulse_width=0.0024)
+
+# Flask setup
+app = Flask(__name__)
+output_frame = None
+lock = threading.Lock()
+streaming_clients = 0
+clients_lock = threading.Lock()
 
 
 class FaceTracker:
@@ -59,8 +72,8 @@ class FaceTracker:
         self.serial_port = serial_port
         self.baud_rate = baud_rate
         self.ser = None
-        self.frame_width = 0
-        self.frame_height = 0
+        self.cam_frame_width = 0
+        self.cam_frame_height = 0
         
         # current servo positions, servos should be positioned at center (0.0) at start
         self.servoPanPos = 0.0
@@ -102,9 +115,9 @@ class FaceTracker:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 180)
         
         # Get actual frame dimensions
-        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"Camera initialized: {self.frame_width}x{self.frame_height}")
+        self.cam_frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.cam_frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Camera initialized: {self.cam_frame_width}x{self.cam_frame_height}")
         
         # Initialize serial port if specified
         if self.serial_port:
@@ -141,25 +154,6 @@ class FaceTracker:
             flags=cv2.CASCADE_SCALE_IMAGE
         )
         
-        # Detect profile faces (left-facing)
-        profile_faces = self.profile_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-        
-        # Detect profile faces (right-facing) by flipping the image
-        gray_flipped = cv2.flip(gray, 1)
-        profile_faces_flipped = self.profile_cascade.detectMultiScale(
-            gray_flipped,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-        
         # Combine all detections with labels
         all_faces = []
         
@@ -167,15 +161,36 @@ class FaceTracker:
         for (x, y, w, h) in frontal_faces:
             all_faces.append((x, y, w, h, 'frontal'))
         
-        # Add left profile faces
-        for (x, y, w, h) in profile_faces:
-            all_faces.append((x, y, w, h, 'profile-left'))
-        
-        # Add right profile faces (adjust coordinates back from flipped image)
-        frame_width = gray.shape[1]
-        for (x, y, w, h) in profile_faces_flipped:
-            x_corrected = frame_width - x - w
-            all_faces.append((x_corrected, y, w, h, 'profile-right'))
+        # Optionally detect profile faces (slower but detects more faces)
+        if FACE_PROFILE_DETECTION:
+            # Detect profile faces (left-facing)
+            profile_faces = self.profile_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30),
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            
+            # Detect profile faces (right-facing) by flipping the image
+            gray_flipped = cv2.flip(gray, 1)
+            profile_faces_flipped = self.profile_cascade.detectMultiScale(
+                gray_flipped,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30),
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            
+            # Add left profile faces
+            for (x, y, w, h) in profile_faces:
+                all_faces.append((x, y, w, h, 'profile-left'))
+            
+            # Add right profile faces (adjust coordinates back from flipped image)
+            frame_width = gray.shape[1]
+            for (x, y, w, h) in profile_faces_flipped:
+                x_corrected = frame_width - x - w
+                all_faces.append((x_corrected, y, w, h, 'profile-right'))
         
         # Remove overlapping detections
         all_faces = self._remove_overlaps(all_faces)
@@ -234,10 +249,6 @@ class FaceTracker:
         Args:
             faces: List of detected faces
         """
-        # TESTING
-        servoPan.value = 0.0
-        servoTilt.value = 0.0
-        return
     
         if len(faces) == 0:
             return
@@ -246,17 +257,19 @@ class FaceTracker:
         largest_face = max(faces, key=lambda f: f[2] * f[3])  # w * h
         x, y, w, h, face_type = largest_face
         
-        # Calculate center of face
-        center_x = x + w // 2
-        center_y = y + h // 2
-        print(f"Largest face center: ({center_x}, {center_y})")
+        # Point of Interest (center of the largest face)
+        poi_x_cam = x + w // 2
+        poi_y_cam = y + h // 2
+
+        print(f"Largest face center: ({poi_x_cam}, {poi_y_cam})")
         
         # Transform to center-origin coordinate system
         # (0,0) at center of frame, positive X to left, positive Y up
-        transformed_x = (self.frame_width // 2) - center_x  # Inverted X
-        transformed_y = (self.frame_height // 2) - center_y  # Inverted Y
-        print(f"Transformed coordinates: ({transformed_x}, {transformed_y})")
-        
+        poi_x_cam_center_origin = poi_x_cam - (self.cam_frame_width // 2) 
+        poi_y_cam_center_origin = (poi_y_cam - (self.cam_frame_height // 2)) * -1  # Camera has Inverted Y
+        if DEBUG:
+            print(f"Transformed to center origin: ({poi_x_cam_center_origin}, {poi_y_cam_center_origin})")
+        """
         # Scale transformed_x to servo pan range
         # Map from [-frame_width/2, frame_width/2] to [SERVO_PAN_MIN, SERVO_PAN_MAX]
         max_x = self.frame_width // 2
@@ -274,25 +287,40 @@ class FaceTracker:
         else:
             scaled_y = 0
         print(f"Scaled to servo range: ({scaled_x:.3f}, {scaled_y:.3f})")
+        """
+        # scale center origin to servo movement increments in FOV units
+        scaled_x = poi_x_cam_center_origin  * (HORIZONTAL_FOV_CAM / self.cam_frame_width)
+        scaled_y = poi_y_cam_center_origin  * (VERTICAL_FOV_CAM / self.cam_frame_height)
+        if DEBUG:
+            print(f"Scaled to FOV increments: ({scaled_x:.3f}, {scaled_y:.3f})")
 
-        print(f"Current servo positions before update: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
+        # convert increments to servo position changes (-1.0 to +1.0)
+        scaled_x_servo = scaled_x / self.cam_frame_width
+        scaled_y_servo = scaled_y / self.cam_frame_height
+        if DEBUG:
+            print(f"Scaled to servo position changes: ({scaled_x_servo:.3f}, {scaled_y_servo:.3f})")
+
+        if DEBUG:
+            print(f"Current servo positions before update: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
         # Move the position relative to current position
-        self.servoPanPos += scaled_x
+        self.servoPanPos -= scaled_x_servo
         if INVERT_Y_SERVO:
-            scaled_y = -scaled_y
-        self.servoTiltPos += scaled_y
-        print(f"Updated servo positions before clamp: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
+            scaled_y_servo = -scaled_y_servo
+        self.servoTiltPos += scaled_y_servo
+        if DEBUG:
+            print(f"Updated servo positions before clamp: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
 
         # Clamp to servo limits
-        self.servoPanPos = max(-1, min(1, self.servoPanPos))
-        self.servoTiltPos = max(-1, min(1, self.servoTiltPos))   
-        print(f"Clamped servo positions: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
+        self.servoPanPos = max(-.8, min(.8, self.servoPanPos))
+        self.servoTiltPos = max(-.8, min(.8, self.servoTiltPos))   
+        if DEBUG:
+            print(f"Clamped servo positions: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
 
-        #TESTING
-        self.servoPanPos = 0.0
+        # TESTING
+        # self.servoPanPos = 0.0
 
-
-        print(f"Sent to servos: {self.servoPanPos:.3f}, {self.servoTiltPos:.3f}")
+        if DEBUG:
+            print(f"Sent to servos: {self.servoPanPos:.3f}, {self.servoTiltPos:.3f}")
         # Move Servos
         try:
             servoPan.value = self.servoPanPos
@@ -358,6 +386,24 @@ class FaceTracker:
         instructions = "Press 'q' to quit"
         cv2.putText(frame, instructions, (10, frame.shape[0] - 20),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Draw center crosshairs
+        height, width = frame.shape[:2]
+        center_x = width // 2
+        center_y = height // 2
+        color = (0, 255, 255)  # Yellow color
+        
+        # Draw vertical dashed line
+        dash_length = 10
+        gap_length = 5
+        for y in range(0, height, dash_length + gap_length):
+            y_end = min(y + dash_length, height)
+            cv2.line(frame, (center_x, y), (center_x, y_end), color, 1)
+        
+        # Draw horizontal dashed line
+        for x in range(0, width, dash_length + gap_length):
+            x_end = min(x + dash_length, width)
+            cv2.line(frame, (x, center_y), (x_end, center_y), color, 1)
     
     def run(self):
         """Run the face tracking loop."""
@@ -399,12 +445,18 @@ class FaceTracker:
                     fps = frame_count / elapsed_time
                 
                 # Add info overlay
-                #self.add_info_overlay(frame, faces, fps)
+                self.add_info_overlay(frame, faces, fps)
                 
-                # Display the frame
-                #cv2.imshow('Face Tracker - OpenCV', frame)
+                # Store frame for Flask streaming (only if clients are connected)
+                global output_frame, lock, streaming_clients, clients_lock
+                with clients_lock:
+                    has_clients = streaming_clients > 0
                 
-                # Check for quit key
+                if has_clients:
+                    with lock:
+                        output_frame = frame.copy()
+                
+                # Check for quit key (non-blocking)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q') or key == 27:  # 'q' or ESC
                     break
@@ -449,10 +501,105 @@ def list_available_cameras(max_cameras=32):
     return available
 
 
+def generate_frames():
+    """Generate frames for Flask streaming."""
+    global output_frame, lock, streaming_clients, clients_lock
+    
+    # Track this client
+    with clients_lock:
+        streaming_clients += 1
+    
+    try:
+        while True:
+            with lock:
+                if output_frame is None:
+                    continue
+                
+                # Encode frame as JPEG with reduced quality (60% instead of default 95%)
+                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
+                (flag, encodedImage) = cv2.imencode(".jpg", output_frame, encode_params)
+                
+                if not flag:
+                    continue
+            
+            # Yield frame in MJPEG format
+            yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + 
+                  bytearray(encodedImage) + b'\r\n')
+    finally:
+        # Untrack this client when they disconnect
+        with clients_lock:
+            streaming_clients -= 1
+
+
+@app.route('/')
+def index():
+    """Video streaming home page."""
+    return """<!DOCTYPE html>
+<html>
+<head>
+    <title>Face Tracker Stream</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background-color: #1a1a1a;
+            color: #ffffff;
+            font-family: Arial, sans-serif;
+            text-align: center;
+        }
+        h1 {
+            color: #4CAF50;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            border: 2px solid #4CAF50;
+            border-radius: 8px;
+        }
+        .info {
+            margin-top: 20px;
+            color: #cccccc;
+        }
+    </style>
+</head>
+<body>
+    <h1>Face Tracker - Live Stream</h1>
+    <img src="/video_feed" alt="Video Stream">
+    <div class="info">
+        <p>Press Ctrl+C in the terminal to stop the tracker</p>
+    </div>
+</body>
+</html>"""
+
+
+@app.route('/video_feed')
+def video_feed():
+    """Video streaming route."""
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
 def main():
     """Main entry point."""
     print("=" * 60)
     print("OpenCV Face Tracker")
+    print("=" * 60)
+    
+    # Get and display IP address for web streaming
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip_address = s.getsockname()[0]
+        s.close()
+    except Exception:
+        ip_address = "localhost"
+    
+    print("\n" + "=" * 60)
+    print("CAMERA STREAM WILL BE AVAILABLE AT:")
+    print(f"  http://{ip_address}:5000")
+    if ip_address != "localhost":
+        print(f"  http://localhost:5000 (from this device)")
     print("=" * 60)
     
     # List available cameras
@@ -460,7 +607,7 @@ def main():
     print(f"\nAvailable cameras: {available_cameras}")
 
     # Test servos
-    testDelaySeconds = 15
+    testDelaySeconds = 1
     print("\nTesting servos...")
     print("Panning servos to FOV left")
     servoPan.value = SERVO_PAN_MAX
@@ -517,7 +664,29 @@ def main():
     
     # Create and run tracker
     tracker = FaceTracker(camera_index=camera_index, serial_port=serial_port, baud_rate=baud_rate)
-    tracker.run()
+    
+    # Run tracker in a separate thread
+    tracker_thread = threading.Thread(target=tracker.run, daemon=True)
+    tracker_thread.start()
+    
+    # Suppress Flask startup messages
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    
+    # Start Flask server
+    print("\n" + "="*60)
+    print("Starting Flask web server...")
+    print(f"View the stream at: http://{ip_address}:5000")
+    if ip_address != "localhost":
+        print(f"  Or from this device: http://localhost:5000")
+    print("Press Ctrl+C to stop")
+    print("="*60 + "\n")
+    
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True, use_reloader=False)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        tracker.cleanup()
     
     return 0
 
