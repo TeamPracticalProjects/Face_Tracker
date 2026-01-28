@@ -330,7 +330,7 @@ class FaceTracker:
         except Exception as e:
             print(f"servo write error: {e}")
 
-        time.sleep(0.001) # wait for servo to repond before sending new data
+        #time.sleep(0.001) # wait for servo to repond before sending new data
     
     def draw_faces(self, frame, faces):
         """
@@ -424,23 +424,26 @@ class FaceTracker:
         start_time = time.time()
         
         try:
+            # Keep the last detection results so we can reuse them on skipped frames
+            faces = []
             while self.running:
                 # Capture frame
                 ret, frame = self.cap.read()
-                
+
                 if not ret:
                     print("Error: Failed to capture frame")
                     break
-                
-                # Detect faces
-                faces = self.detect_faces(frame)
-                
-                # Send first face coordinates to serial port
+
+                # Perform face detection only on every 3rd frame to reduce CPU
+                if frame_count % 3 == 0:
+                    faces = self.detect_faces(frame)
+
+                # Send first face coordinates to serial port (uses most recent detections)
                 self.send_to_serial(faces)
-                
-                # Draw faces
+
+                # Draw faces (uses most recent detections)
                 self.draw_faces(frame, faces)
-                
+
                 # Calculate FPS
                 frame_count += 1
                 if frame_count % 10 == 0:
