@@ -14,17 +14,33 @@ Captures video from the laptop camera and tracks faces in real-time.
 """
 DEBUG = False
 FACE_PROFILE_DETECTION = False  # Set to True to detect profile faces (slower but more comprehensive)
+DETECT_EVERY_X_FRAMES = 3  # Detect every x frames for performance
 
 import cv2
 import sys
 import serial
 import time
+import argparse
 from gpiozero import AngularServo, Device
 from gpiozero.pins.pigpio import PiGPIOFactory
 from flask import Flask, render_template, Response
 import threading
 import logging
 import os
+import numpy as np
+import subprocess
+import io
+
+# Try to import picamera2 for Pi camera support
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+    print("Picamera2 library is available")
+except ImportError:
+    PICAMERA2_AVAILABLE = False
+    print("Note: picamera2 not available, will try libcamera-still/vid")
+
+
 
 # Use RPi.GPIO for PWM
 Device.pin_factory = PiGPIOFactory()
@@ -78,6 +94,8 @@ class FaceTracker:
         self.ser = None
         self.cam_frame_width = 0
         self.cam_frame_height = 0
+        self.use_picamera2 = False
+        self.picam2 = None
         
         # current servo positions, servos should be positioned at center (0.0) at start
         self.servoPanPos = 0.0
@@ -107,10 +125,10 @@ class FaceTracker:
         
         print("Loaded frontal and profile face detectors")
         
-        # Initialize video capture
-        self.cap = cv2.VideoCapture(self.camera_index)
+        # Initialize video capture with Raspberry Pi camera support
+        self.cap = self._initialize_camera(self.camera_index)
         
-        if not self.cap.isOpened():
+        if self.cap is None or not self.cap.isOpened():
             print(f"Error: Could not open camera at index {self.camera_index}")
             return False
         
@@ -136,6 +154,237 @@ class FaceTracker:
         print("Face tracker initialized successfully!")
         return True
     
+    def _initialize_camera(self, camera_index):
+        """Initialize camera with support for both USB and Raspberry Pi CSI cameras."""
+        print(f"Attempting to open camera {camera_index}...")
+        print(f"Picamera2 available: {PICAMERA2_AVAILABLE}")
+        
+        # Try 0: For camera index 0-2 on Raspberry Pi, try picamera2 first if available
+        if camera_index <= 2 and PICAMERA2_AVAILABLE:
+            print("Trying Picamera2 library for Raspberry Pi camera...")
+            try:
+                self.picam2 = Picamera2()
+                config = self.picam2.create_preview_configuration(
+                    main={"size": (640, 480), "format": "RGB888"}
+                )
+                self.picam2.configure(config)
+                print("Starting Picamera2...")
+                self.picam2.start()
+                time.sleep(2)  # Let camera warm up
+                
+                # Test capture
+                print("Testing frame capture...")
+                frame = self.picam2.capture_array()
+                if frame is not None and frame.size > 0:
+                    print(f"Successfully initialized Picamera2!")
+                    print(f"Frame size: {frame.shape}")
+                    self.use_picamera2 = True
+                    # Create a dummy VideoCapture object for compatibility
+                    class Picamera2Wrapper:
+                        def __init__(self, picam2):
+                            self.picam2 = picam2
+                        
+                        def isOpened(self):
+                            return True
+                        
+                        def read(self):
+                            frame = self.picam2.capture_array()
+                            # Picamera2 returns RGB, but OpenCV expects BGR
+                            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                            return True, frame
+                        
+                        def release(self):
+                            if self.picam2:
+                                self.picam2.stop()
+                        
+                        def get(self, prop):
+                            if prop == cv2.CAP_PROP_FRAME_WIDTH:
+                                return 640
+                            elif prop == cv2.CAP_PROP_FRAME_HEIGHT:
+                                return 480
+                            return 0
+                        
+                        def set(self, prop, value):
+                            # Ignore set calls for picamera2
+                            return True
+                    
+                    return Picamera2Wrapper(self.picam2)
+                else:
+                    print("Picamera2 capture returned invalid frame")
+            except Exception as e:
+                print(f"Picamera2 failed: {e}")
+                import traceback
+                traceback.print_exc()
+                if self.picam2:
+                    try:
+                        self.picam2.stop()
+                    except:
+                        pass
+                    self.picam2 = None
+        elif camera_index <= 2:
+            print("Picamera2 not available, trying other methods...")
+        
+        # Try 1: Try /dev/videoX explicitly with V4L2 first (most reliable for Pi camera)
+        device_path = f"/dev/video{camera_index}"
+        print(f"Trying {device_path} with V4L2 backend...")
+        cap = cv2.VideoCapture(device_path, cv2.CAP_V4L2)
+        if cap.isOpened():
+            print(f"Successfully opened {device_path} with V4L2")
+            # For Pi CSI camera, we need to set format properties in specific order
+            # Set pixel format first
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('Y', 'U', 'Y', 'V'))
+            # Set resolution
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            # Set other properties
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Set convert RGB flag - important for some Pi cameras
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+            
+            print(f"Configured camera: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+            print("Waiting for camera to initialize...")
+            time.sleep(2)  # Longer wait for Pi camera
+            
+            # Flush any initial frames and try reading
+            print("Flushing initial frames...")
+            for i in range(10):
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    print(f"Successfully reading frames from {device_path}")
+                    print(f"Frame size: {frame.shape}, dtype: {frame.dtype}")
+                    return cap
+                time.sleep(0.1)
+            
+            print(f"Could not read valid frames after multiple attempts")
+            cap.release()
+        else:
+            cap.release()
+        
+        # Try 2: Try with different backend initialization order
+        print(f"Trying {device_path} with alternate V4L2 configuration...")
+        cap = cv2.VideoCapture()
+        cap.open(device_path, cv2.CAP_V4L2)
+        if cap.isOpened():
+            # Try with minimal configuration
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('Y', 'U', 'Y', 'V'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+            time.sleep(2)
+            
+            for i in range(10):
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    print(f"Successfully reading with alternate config")
+                    print(f"Frame size: {frame.shape}")
+                    return cap
+                time.sleep(0.1)
+            cap.release()
+        
+        # Try 3: GStreamer pipeline for Pi camera with explicit format
+        print(f"Trying GStreamer pipeline for {device_path}...")
+        gstreamer_pipeline = (
+            f"v4l2src device={device_path} ! "
+            "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! "
+            "videoconvert ! "
+            "video/x-raw,format=BGR ! "
+            "appsink"
+        )
+        cap = cv2.VideoCapture(gstreamer_pipeline, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            print("Successfully opened camera with GStreamer pipeline")
+            time.sleep(1)
+            for i in range(5):
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    print(f"Successfully reading frames via GStreamer")
+                    print(f"Frame size: {frame.shape}")
+                    return cap
+                time.sleep(0.2)
+            cap.release()
+        
+        # Try 4: V4L2 backend with camera index
+        print(f"Trying camera index {camera_index} with V4L2 backend...")
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+        if cap.isOpened():
+            print(f"Successfully opened camera {camera_index} with V4L2 backend")
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            time.sleep(1)
+            for attempt in range(5):
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    print(f"Frame size: {frame.shape}")
+                    return cap
+                time.sleep(0.2)
+            cap.release()
+        else:
+            cap.release()
+        
+        # Try 3: Direct index (works for USB cameras)
+        print(f"Trying camera index {camera_index} with default backend...")
+        cap = cv2.VideoCapture(camera_index)
+        if cap.isOpened():
+            print(f"Successfully opened camera {camera_index} with default backend")
+            ret, _ = cap.read()
+            if ret:
+                return cap
+            else:
+                print("Could open device but cannot read frames, trying next method...")
+                cap.release()
+        else:
+            cap.release()
+        
+        # Try 4: For Raspberry Pi camera (index 0), try GStreamer pipeline
+        if camera_index == 0:
+            print("Trying Raspberry Pi camera via GStreamer with libcamerasrc...")
+            gstreamer_pipeline = (
+                "libcamerasrc ! "
+                "video/x-raw, width=640, height=480, framerate=30/1 ! "
+                "videoconvert ! appsink"
+            )
+            cap = cv2.VideoCapture(gstreamer_pipeline, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                print("Successfully opened Raspberry Pi camera with GStreamer")
+                ret, _ = cap.read()
+                if ret:
+                    return cap
+                else:
+                    print("Could open device but cannot read frames, trying next method...")
+                    cap.release()
+            else:
+                cap.release()
+            
+            # Try 5: Alternative GStreamer pipeline
+            print("Trying GStreamer with v4l2src...")
+            gstreamer_pipeline_v4l2 = (
+                "v4l2src device=/dev/video0 ! "
+                "video/x-raw, width=640, height=480, framerate=30/1 ! "
+                "videoconvert ! appsink"
+            )
+            cap = cv2.VideoCapture(gstreamer_pipeline_v4l2, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                print("Successfully opened camera with GStreamer v4l2src")
+                ret, _ = cap.read()
+                if ret:
+                    return cap
+                else:
+                    print("Could open device but cannot read frames")
+                    cap.release()
+            else:
+                cap.release()
+        
+        print(f"Failed to open camera {camera_index} with any method")
+        print("\nPlease check:")
+        print("  1. Is the camera connected properly?")
+        print("  2. Run: ls -l /dev/video*  (to see available video devices)")
+        print("  3. Run: v4l2-ctl --list-devices  (to see camera details)")
+        print("  4. Install v4l-utils if needed: sudo apt-get install v4l-utils")
+        return None
+    
     def detect_faces(self, frame):
         """
         Detect faces in a frame (frontal and profile).
@@ -148,7 +397,7 @@ class FaceTracker:
         """
         # Convert to grayscale for better face detection
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
+
         # Detect frontal faces
         frontal_faces = self.face_cascade.detectMultiScale(
             gray,
@@ -290,17 +539,24 @@ class FaceTracker:
         # reduced the sleep at the end of this function
         # also commented out the print of face detection coordinates above
         increment = 0.005
-        no_movement_threshold = 0.002
+        no_movement_threshold = 0.002  # servo distance from center before moving
 
-        if poi_x_cam_center_origin > no_movement_threshold:
-            amount_to_move_x = increment
+        # Only move if face is not centered (outside the threshold)
+        if abs(poi_x_cam_center_origin) > no_movement_threshold:
+            if poi_x_cam_center_origin > 0:
+                amount_to_move_x = increment
+            else:
+                amount_to_move_x = -increment
         else:
-            amount_to_move_x = -increment
+            amount_to_move_x = 0  # Don't move if centered
 
-        if poi_y_cam_center_origin > no_movement_threshold:
-            amount_to_move_y = increment
+        if abs(poi_y_cam_center_origin) > no_movement_threshold:
+            if poi_y_cam_center_origin > 0:
+                amount_to_move_y = increment
+            else:
+                amount_to_move_y = -increment
         else:
-            amount_to_move_y = -increment
+            amount_to_move_y = 0  # Don't move if centered
 
         if DEBUG:
             print(f"Current servo positions before update: ({self.servoPanPos:.3f}, {self.servoTiltPos:.3f})")
@@ -434,8 +690,16 @@ class FaceTracker:
                     print("Error: Failed to capture frame")
                     break
 
+                '''
+                # Scale frame to width of 320 for better performance
+                height, width = frame.shape[:2]
+                target_width = 320
+                scale_factor = target_width / width
+                new_height = int(height * scale_factor)
+                frame = cv2.resize(frame, (target_width, new_height))
+                '''
                 # Perform face detection only on every 3rd frame to reduce CPU
-                if frame_count % 3 == 0:
+                if frame_count % DETECT_EVERY_X_FRAMES == 0:
                     faces = self.detect_faces(frame)
 
                 # Send first face coordinates to serial port (uses most recent detections)
@@ -477,6 +741,21 @@ class FaceTracker:
         """Clean up resources."""
         self.running = False
         
+        if self.use_picamera2 and self.picam2 is not None:
+            try:
+                self.picam2.stop()
+                print("Picamera2 stopped")
+            except:
+                pass
+        
+        if self.libcamera_process is not None:
+            try:
+                self.libcamera_process.terminate()
+                self.libcamera_process.wait(timeout=2)
+                print("libcamera process terminated")
+            except:
+                pass
+        
         if self.cap is not None:
             self.cap.release()
         
@@ -488,22 +767,85 @@ class FaceTracker:
         print("\nFace tracker stopped")
 
 
-def list_available_cameras(max_cameras=32):
+def list_available_cameras(max_cameras=32, detailed=False):
     """
     List all available cameras.
     
     Args:
         max_cameras: Maximum number of camera indices to check
+        detailed: If True, also show camera resolution and backend
         
     Returns:
         List of available camera indices
     """
     available = []
+    print(f"\nScanning for cameras (checking indices 0-{max_cameras-1})...")
+    print("-" * 60)
+    
+    # Check for Raspberry Pi camera first
+    print("Checking for Raspberry Pi CSI camera...")
+    # Try GStreamer pipeline for Pi camera
+    gstreamer_pipeline = (
+        "libcamerasrc ! "
+        "video/x-raw, width=640, height=480, framerate=30/1 ! "
+        "videoconvert ! appsink"
+    )
+    cap = cv2.VideoCapture(gstreamer_pipeline, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Raspberry Pi Camera: {width}x{height} (GStreamer/libcamera)")
+        available.append(0)  # Pi camera is typically camera 0
+        cap.release()
+    else:
+        cap.release()
+        # Try /dev/video0 with V4L2
+        cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)
+        if cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"Camera at /dev/video0: {width}x{height} (V4L2)")
+            if 0 not in available:
+                available.append(0)
+            cap.release()
+    
+    print("\nChecking USB cameras...")
     for i in range(max_cameras):
+        if i in available:
+            continue  # Already found this camera
         cap = cv2.VideoCapture(i)
         if cap.isOpened():
             available.append(i)
+            if detailed:
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                backend = cap.getBackendName()
+                print(f"Camera {i}: {width}x{height} (backend: {backend})")
+            else:
+                print(f"Camera {i}: Available")
             cap.release()
+    
+    print("-" * 60)
+    if available:
+        print(f"\nFound {len(available)} camera(s): {sorted(available)}")
+    else:
+        print("\nNo cameras found.")
+        print("\nTroubleshooting tips for Raspberry Pi Camera:")
+        print("  1. Check physical connection - ensure ribbon cable is properly inserted")
+        print("  2. Test camera with: libcamera-hello")
+        print("     (If this works, the camera hardware is functional)")
+        print("  3. Check if camera is detected: vcgencmd get_camera")
+        print("  4. Install required packages:")
+        print("     sudo apt-get update")
+        print("     sudo apt-get install -y python3-opencv")
+        print("     sudo apt-get install -y libcamera-apps")
+        print("  5. For GStreamer support:")
+        print("     sudo apt-get install -y gstreamer1.0-tools")
+        print("     sudo apt-get install -y gstreamer1.0-plugins-base")
+        print("     sudo apt-get install -y gstreamer1.0-plugins-good")
+        print("  6. Reboot after installing packages")
+        print("\n  Note: Modern Raspberry Pi OS uses libcamera (no raspi-config needed)")
+    
     return available
 
 
@@ -608,9 +950,48 @@ def main():
         print(f"  http://localhost:5000 (from this device)")
     print("=" * 60)
     
-    # List available cameras
-    available_cameras = list_available_cameras()
-    print(f"\nAvailable cameras: {available_cameras}")
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Face Tracking with OpenCV and Raspberry Pi',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''Examples:
+  %(prog)s --list-cameras               List available cameras and exit
+  %(prog)s -l                            List available cameras and exit
+  %(prog)s 0 COM5 115200                Use camera 0 with serial port
+  %(prog)s 1 /dev/cu.usbserial-0001     Use camera 1 with serial port'''
+    )
+    parser.add_argument(
+        '-l', '--list-cameras',
+        action='store_true',
+        help='List available cameras and exit'
+    )
+    parser.add_argument(
+        'camera_index',
+        nargs='?',
+        type=int,
+        default=0,
+        help='Camera index to use (default: 0)'
+    )
+    parser.add_argument(
+        'serial_port',
+        nargs='?',
+        default='COM5',
+        help='Serial port for Arduino (default: COM5)'
+    )
+    parser.add_argument(
+        'baud_rate',
+        nargs='?',
+        type=int,
+        default=115200,
+        help='Serial baud rate (default: 115200)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Handle list-cameras option
+    if args.list_cameras:
+        list_available_cameras(max_cameras=32, detailed=True)
+        return 0
 
     # Test servos
     testDelaySeconds = 1
@@ -640,33 +1021,14 @@ def main():
     servoTilt.value = 0
     print("Servos test complete.")
 
-    # Parse command line arguments
-    camera_index = 0
-    serial_port = "COM5"  # Use the port that your Arduino is on
-    baud_rate = 115200
+    # Use parsed arguments
+    camera_index = args.camera_index
+    serial_port = args.serial_port
+    baud_rate = args.baud_rate
     
-    if len(sys.argv) > 1:
-        try:
-            camera_index = int(sys.argv[1])
-            print(f"Using camera index: {camera_index}")
-        except ValueError:
-            print(f"Invalid camera index: {sys.argv[1]}, using default (0)")
-    
-    if len(sys.argv) > 2:
-        serial_port = sys.argv[2]
-        print(f"Serial port: {serial_port}")
-    
-    if len(sys.argv) > 3:
-        try:
-            baud_rate = int(sys.argv[3])
-            print(f"Baud rate: {baud_rate}")
-        except ValueError:
-            print(f"Invalid baud rate: {sys.argv[3]}, using default (9600)")
-    
-    print("\nUsage: python face_tracker.py [camera_index] [serial_port] [baud_rate]")
-    print("Example: python face_tracker.py 0 \"COM5\" 9600")
-    print("Example: python face_tracker.py 1 \"/dev/cu.usbserial-0001\" 115200")
-    print()
+    print(f"\nUsing camera index: {camera_index}")
+    print(f"Serial port: {serial_port}")
+    print(f"Baud rate: {baud_rate}")
     
     # Create and run tracker
     tracker = FaceTracker(camera_index=camera_index, serial_port=serial_port, baud_rate=baud_rate)

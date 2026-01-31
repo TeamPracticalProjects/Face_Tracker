@@ -48,6 +48,13 @@ Real-time face tracking system using OpenCV and servo control for Raspberry Pi. 
 - gpiozero==2.0.1
 - flask==3.0.0
 
+# problem with picamera2 ??
+# If you're in a virtual environment, you can recreate it with system packages
+deactivate 2>/dev/null  # exit venv if in one
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+python face_tracker_rpi.py 2
+
 ## Usage
 
 ### Basic Usage
@@ -61,6 +68,7 @@ python3 face_tracker_rpi.py
 ```bash
 python3 face_tracker_rpi.py [camera_index] [serial_port] [baud_rate]
 ```
+
 
 **Examples:**
 ```bash
